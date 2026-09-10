@@ -1,0 +1,10 @@
+scanpy==1.12.1
+anndata
+numpy
+pandas
+scipy
+matplotlib
+harmonypy
+python-igraph
+leidenalg
+scrublet
