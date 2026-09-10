@@ -1,364 +1,458 @@
-Preprocessing for pancreatic-islet scRNA-seq libraries generated with
-Ficoll-based and gradient-free isolation workflows.
-
-Expected input:
-    data/ficoll_counts.h5ad
-    data/gradient_free_counts.h5ad
-
-Each input file should contain count-level gene-by-cell data in .X, or
-in a layer named "counts". If ambient-RNA correction with CellBender was
-performed before this step, use the CellBender-corrected count matrices
-as these inputs.
-
-Public workflow labels used throughout this repository:
-    Ficoll
-    Gradient-free
-
-Main steps:
-- sample-wise QC
-- filtering: >=200 detected genes, >=500 total counts, <=10% mtRNA
-- Scrublet doublet detection
-- normalization to 10,000 counts/cell and log1p transformation
-- initial broad clustering using 2,000 HVGs
-- endocrine/exocrine subset
-- repeated preprocessing of the subset using 3,000 HVGs
-- scaling, PCA, Harmony integration, neighbors, UMAP, Leiden clustering
-"""
-
-from pathlib import Path
-
-import anndata as ad
-import scanpy as sc
-import scanpy.external as sce
-
-
-DATA_DIR = Path("data")
-OUT_DIR = DATA_DIR / "processed"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-FICOLL_FILE = DATA_DIR / "ficoll_counts.h5ad"
-GRADIENT_FREE_FILE = DATA_DIR / "gradient_free_counts.h5ad"
-OUTPUT_FILE = OUT_DIR / "islets_preprocessed.h5ad"
-
-MIN_GENES = 200
-MIN_COUNTS = 500
-MAX_MT_PERCENT = 10.0
-
-NORMALIZATION_TARGET = 1e4
-
-# Initial broad analysis
-N_HVG_INITIAL = 2000
-INITIAL_LEIDEN_RESOLUTION = 0.5
-
-# Detailed endocrine/exocrine reanalysis
-N_HVG_SUBSET = 3000
-N_PCS = 50
-N_NEIGHBORS = 30
-N_PCS_NEIGHBORS = 30
-SCALE_MAX_VALUE = 10
-UMAP_MIN_DIST = 0.3
-SUBSET_LEIDEN_RESOLUTIONS = (0.5, 1.0)
-
-# Initial clusters retained in the endocrine/exocrine subset in the
-# original analysis.
-KEEP_CLUSTERS = {"0", "1", "3", "5", "6", "10", "13"}
-
-RANDOM_STATE = 0
-
-
-def get_counts(adata):
-    """Return a copy of the raw/count-level matrix."""
-    if "counts" in adata.layers:
-        return adata.layers["counts"].copy()
-    return adata.X.copy()
-
-
-def load_library(path, workflow):
-    """Load one library and attach a public workflow label."""
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Input file not found: {path}\n"
-            "Place the count-level AnnData file at this path or edit "
-            "FICOLL_FILE / GRADIENT_FREE_FILE at the top of the script."
-        )
-
-    adata = sc.read_h5ad(path)
-    adata.var_names_make_unique()
-
-    # Prefix barcodes so that they remain unique after concatenation.
-    prefix = workflow.lower().replace("-", "_").replace(" ", "_")
-    adata.obs_names = [f"{prefix}:{x}" for x in adata.obs_names]
-
-    adata.obs["workflow"] = workflow
-    adata.layers["counts"] = get_counts(adata)
-    adata.X = adata.layers["counts"].copy()
-    return adata
-
-
-def add_qc_metrics(adata):
-    """Calculate gene/count, mitochondrial, and ribosomal QC metrics."""
-    adata.var["mt"] = adata.var_names.str.startswith("mt-")
-    adata.var["ribo"] = (
-        adata.var_names.str.startswith("Rps")
-        | adata.var_names.str.startswith("Rpl")
-    )
-
-    sc.pp.calculate_qc_metrics(
-        adata,
-        qc_vars=["mt", "ribo"],
-        percent_top=None,
-        log1p=False,
-        inplace=True,
-    )
-
-
-def filter_qc(adata):
-    """Apply the QC thresholds used for the analysis."""
-    keep = (
-        (adata.obs["n_genes_by_counts"] >= MIN_GENES)
-        & (adata.obs["total_counts"] >= MIN_COUNTS)
-        & (adata.obs["pct_counts_mt"] <= MAX_MT_PERCENT)
-    )
-    return adata[keep].copy()
-
-
-def run_scrublet(adata):
-    """Detect putative doublets separately within each library."""
-    sc.pp.scrublet(
-        adata,
-        expected_doublet_rate=0.05,
-        sim_doublet_ratio=2.0,
-        n_prin_comps=30,
-        random_state=RANDOM_STATE,
-    )
-
-    if "predicted_doublet" not in adata.obs:
-        raise RuntimeError(
-            "Scrublet finished without creating 'predicted_doublet'."
-        )
-
-    adata.obs["scrublet_db"] = (
-        adata.obs["predicted_doublet"].astype(bool)
-    )
-
-    return adata[~adata.obs["scrublet_db"]].copy()
-
-
-def normalize_log(adata):
-    """Restore counts, normalize to 10,000 counts/cell, and log1p."""
-    adata.X = adata.layers["counts"].copy()
-
-    sc.pp.normalize_total(
-        adata,
-        target_sum=NORMALIZATION_TARGET,
-    )
-    sc.pp.log1p(adata)
-
-    adata.layers["lognorm"] = adata.X.copy()
-
-
-def run_initial_analysis(adata):
-    """
-    Broad analysis used only to define the endocrine/exocrine subset.
-
-    This function returns an HVG-restricted object, while the complete
-    all-gene object is kept separately so that subset preprocessing can
-    restart from the original counts.
-    """
-    work = adata.copy()
-
-    sc.pp.highly_variable_genes(
-        work,
-        n_top_genes=N_HVG_INITIAL,
-    )
-
-    work = work[:, work.var["highly_variable"]].copy()
-
-    sc.pp.scale(
-        work,
-        max_value=SCALE_MAX_VALUE,
-    )
-
-    sc.tl.pca(
-        work,
-        n_comps=N_PCS,
-        svd_solver="arpack",
-        random_state=RANDOM_STATE,
-    )
-
-    sc.pp.neighbors(
-        work,
-        n_neighbors=N_NEIGHBORS,
-        n_pcs=N_PCS_NEIGHBORS,
-        use_rep="X_pca",
-        random_state=RANDOM_STATE,
-    )
-
-    sc.tl.umap(
-        work,
-        min_dist=UMAP_MIN_DIST,
-        random_state=RANDOM_STATE,
-    )
-
-    sc.tl.leiden(
-        work,
-        resolution=INITIAL_LEIDEN_RESOLUTION,
-        key_added="leiden_res0_5",
-        random_state=RANDOM_STATE,
-    )
-
-    return work
-
-
-def run_subset_analysis(adata):
-    """Repeat preprocessing for the endocrine/exocrine subset."""
-    normalize_log(adata)
-
-    # Store the complete log-normalized matrix for marker/stress plots.
-    adata.raw = adata.copy()
-
-    sc.pp.highly_variable_genes(
-        adata,
-        n_top_genes=N_HVG_SUBSET,
-        batch_key="workflow",
-    )
-
-    work = adata[:, adata.var["highly_variable"]].copy()
-
-    sc.pp.scale(
-        work,
-        max_value=SCALE_MAX_VALUE,
-    )
-
-    sc.tl.pca(
-        work,
-        n_comps=N_PCS,
-        svd_solver="arpack",
-        random_state=RANDOM_STATE,
-    )
-
-    sce.pp.harmony_integrate(
-        work,
-        key="workflow",
-        basis="X_pca",
-        adjusted_basis="X_pca_harmony",
-    )
-
-    sc.pp.neighbors(
-        work,
-        n_neighbors=N_NEIGHBORS,
-        n_pcs=N_PCS_NEIGHBORS,
-        use_rep="X_pca_harmony",
-        random_state=RANDOM_STATE,
-    )
-
-    sc.tl.umap(
-        work,
-        min_dist=UMAP_MIN_DIST,
-        random_state=RANDOM_STATE,
-    )
-
-    for resolution in SUBSET_LEIDEN_RESOLUTIONS:
-        key = "leiden_endo_exo_res" + str(resolution).replace(".", "_")
-        sc.tl.leiden(
-            work,
-            resolution=resolution,
-            key_added=key,
-            random_state=RANDOM_STATE,
-        )
-
-    # Restore full log-normalized genes in .raw after HVG restriction.
-    work.raw = adata.raw
-
-    # Keep the count/lognorm matrices for the HVGs present in work.X.
-    work.layers["counts"] = adata[
-        :, work.var_names
-    ].layers["counts"].copy()
-
-    work.layers["lognorm"] = adata[
-        :, work.var_names
-    ].layers["lognorm"].copy()
-
-    return work
-
-
-# ---------------------------------------------------------------------
-# Load and QC each library separately
-# ---------------------------------------------------------------------
-
-libraries = [
-    load_library(FICOLL_FILE, "Ficoll"),
-    load_library(GRADIENT_FREE_FILE, "Gradient-free"),
-]
-
-qc_libraries = []
-
-for library in libraries:
-    add_qc_metrics(library)
-    library = filter_qc(library)
-    library = run_scrublet(library)
-    qc_libraries.append(library)
-
-
-# Combine after sample-wise QC and doublet detection.
-adata_all = ad.concat(
-    qc_libraries,
-    join="inner",
-    merge="same",
-)
-
-adata_all.layers["counts"] = get_counts(adata_all)
-
-print("Cells after QC and doublet removal:")
-print(adata_all.obs["workflow"].value_counts())
-
-
-# ---------------------------------------------------------------------
-# Initial broad clustering
-# ---------------------------------------------------------------------
-
-normalize_log(adata_all)
-
-adata_initial = run_initial_analysis(adata_all)
-
-# Copy the initial cluster labels back to the complete all-gene object.
-adata_all.obs["leiden_res0_5"] = (
-    adata_initial.obs["leiden_res0_5"]
-    .reindex(adata_all.obs_names)
-    .astype(str)
-)
-
-print("\nInitial Leiden clusters:")
-print(
-    adata_all.obs["leiden_res0_5"]
-    .value_counts()
-    .sort_index()
-)
-
-
-# ---------------------------------------------------------------------
-# Endocrine/exocrine subset from the complete count matrix
-# ---------------------------------------------------------------------
-
-subset_mask = (
-    adata_all.obs["leiden_res0_5"]
-    .astype(str)
-    .isin(KEEP_CLUSTERS)
-)
-
-adata_subset_full = adata_all[subset_mask].copy()
-
-# Restart the detailed analysis from raw counts, not from the initial
-# 2,000-HVG matrix.
-adata_subset_full.X = (
-    adata_subset_full.layers["counts"].copy()
-)
-
-adata_final = run_subset_analysis(
-    adata_subset_full
-)
-
-adata_final.write_h5ad(OUTPUT_FILE)
-
-print(f"\nSaved: {OUTPUT_FILE}")
-print(adata_final)
+{"cells": [
+{
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Pancreatic islet scRNA-seq preprocessing and quality control\n",
+    "\n",
+    "This notebook is a cleaned public version of the preprocessing/QC notebook used for the pancreatic-islet scRNA-seq analysis.\n",
+    "\n",
+    "Only the two libraries used for the manuscript comparison are retained:\n",
+    "\n",
+    "- **Ficoll**\n",
+    "- **Gradient-free**\n",
+    "\n",
+    "Internal sample names and unrelated libraries have been removed. All input/output paths are relative so that the notebook can be placed directly in the GitHub repository.\n",
+    "\n",
+    "The input is expected to be a SeekSoul/SeekGene-style **filtered feature-barcode matrix** for each library."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Imports and paths\n",
+    "\n",
+    "Place the two filtered feature-barcode matrices in:\n",
+    "\n",
+    "```text\n",
+    "data/\n",
+    "├── ficoll/\n",
+    "│   └── filtered_feature_bc_matrix/\n",
+    "└── gradient_free/\n",
+    "    └── filtered_feature_bc_matrix/\n",
+    "```\n",
+    "\n",
+    "The final QC-filtered AnnData object and a cell-count summary are written to `data/processed/` and `results/`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from pathlib import Path\n",
+    "import warnings\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "import scanpy as sc\n",
+    "import scrublet as scr\n",
+    "\n",
+    "from scipy.stats import median_abs_deviation as mad\n",
+    "\n",
+    "warnings.simplefilter(\"ignore\", FutureWarning)\n",
+    "warnings.simplefilter(\"ignore\", UserWarning)\n",
+    "warnings.simplefilter(\"ignore\", RuntimeWarning)\n",
+    "\n",
+    "DATA_DIR = Path(\"data\")\n",
+    "RESULTS_DIR = Path(\"results\")\n",
+    "PROCESSED_DIR = DATA_DIR / \"processed\"\n",
+    "\n",
+    "RESULTS_DIR.mkdir(parents=True, exist_ok=True)\n",
+    "PROCESSED_DIR.mkdir(parents=True, exist_ok=True)\n",
+    "\n",
+    "SAMPLE_DIRS = {\n",
+    "    \"Ficoll\": DATA_DIR / \"ficoll\" / \"filtered_feature_bc_matrix\",\n",
+    "    \"Gradient-free\": DATA_DIR / \"gradient_free\" / \"filtered_feature_bc_matrix\",\n",
+    "}\n",
+    "\n",
+    "OUTPUT_FILE = PROCESSED_DIR / \"pancreatic_islets_qc.h5ad\"\n",
+    "QC_SUMMARY_FILE = RESULTS_DIR / \"qc_cell_counts.csv\"\n",
+    "\n",
+    "sc.settings.verbosity = 2\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Load the two libraries\n",
+    "\n",
+    "Raw UMI counts are stored in `adata.layers[\"counts\"]` before any downstream transformation."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def load_library(matrix_dir, workflow):\n",
+    "    if not matrix_dir.exists():\n",
+    "        raise FileNotFoundError(\n",
+    "            f\"Matrix directory not found: {matrix_dir}\\n\"\n",
+    "            \"Check SAMPLE_DIRS at the top of the notebook.\"\n",
+    "        )\n",
+    "\n",
+    "    adata = sc.read_10x_mtx(\n",
+    "        matrix_dir,\n",
+    "        var_names=\"gene_symbols\",\n",
+    "        make_unique=True,\n",
+    "    )\n",
+    "\n",
+    "    adata.obs[\"workflow\"] = workflow\n",
+    "    adata.layers[\"counts\"] = adata.X.copy()\n",
+    "\n",
+    "    print(\n",
+    "        f\"{workflow}: \"\n",
+    "        f\"{adata.n_obs:,} cells, \"\n",
+    "        f\"{adata.n_vars:,} genes\"\n",
+    "    )\n",
+    "\n",
+    "    return adata\n",
+    "\n",
+    "\n",
+    "adatas = {\n",
+    "    workflow: load_library(path, workflow)\n",
+    "    for workflow, path in SAMPLE_DIRS.items()\n",
+    "}\n",
+    "\n",
+    "initial_cell_counts = {\n",
+    "    workflow: adata.n_obs\n",
+    "    for workflow, adata in adatas.items()\n",
+    "}\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Calculate QC metrics\n",
+    "\n",
+    "The original notebook calculated mitochondrial, ribosomal, hemoglobin-associated, and top-20-gene fractions for each library."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def calculate_qc_metrics(adata):\n",
+    "    adata.var[\"mt\"] = adata.var_names.str.contains(r\"^mt-\", regex=True)\n",
+    "    adata.var[\"ribo\"] = adata.var_names.str.contains(r\"^Rp[sl]\", regex=True)\n",
+    "    adata.var[\"hb\"] = adata.var_names.str.contains(r\"^Hb[^(P)]\", regex=True)\n",
+    "\n",
+    "    sc.pp.calculate_qc_metrics(\n",
+    "        adata,\n",
+    "        qc_vars=[\"mt\", \"ribo\", \"hb\"],\n",
+    "        percent_top=[20],\n",
+    "        log1p=True,\n",
+    "        inplace=True,\n",
+    "    )\n",
+    "\n",
+    "    # Remove redundant total-count columns generated for QC gene sets.\n",
+    "    remove = [\n",
+    "        \"total_counts_mt\",\n",
+    "        \"log1p_total_counts_mt\",\n",
+    "        \"total_counts_ribo\",\n",
+    "        \"log1p_total_counts_ribo\",\n",
+    "        \"total_counts_hb\",\n",
+    "        \"log1p_total_counts_hb\",\n",
+    "    ]\n",
+    "\n",
+    "    adata.obs = adata.obs[\n",
+    "        [column for column in adata.obs.columns if column not in remove]\n",
+    "    ]\n",
+    "\n",
+    "    return adata\n",
+    "\n",
+    "\n",
+    "adatas = {\n",
+    "    workflow: calculate_qc_metrics(adata)\n",
+    "    for workflow, adata in adatas.items()\n",
+    "}\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Inspect QC distributions\n",
+    "\n",
+    "These plots are intended as a visual QC check before filtering. They do not apply additional thresholds."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))\n",
+    "\n",
+    "for ax, (workflow, adata) in zip(axes, adatas.items()):\n",
+    "    scatter = ax.scatter(\n",
+    "        adata.obs[\"log1p_total_counts\"],\n",
+    "        adata.obs[\"log1p_n_genes_by_counts\"],\n",
+    "        c=adata.obs[\"pct_counts_mt\"],\n",
+    "        s=8,\n",
+    "        alpha=0.7,\n",
+    "    )\n",
+    "\n",
+    "    ax.set_title(workflow)\n",
+    "    ax.set_xlabel(\"log1p total counts\")\n",
+    "    ax.set_ylabel(\"log1p detected genes\")\n",
+    "\n",
+    "    colorbar = plt.colorbar(scatter, ax=ax)\n",
+    "    colorbar.set_label(\"Mitochondrial transcripts (%)\")\n",
+    "\n",
+    "fig.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Primary cell-level QC\n",
+    "\n",
+    "The original QC notebook used a deliberately permissive pancreas-oriented filter:\n",
+    "\n",
+    "1. remove cells with hemoglobin-associated transcripts ≥20%;\n",
+    "2. flag mitochondrial-content outliers using **5 median absolute deviations (MADs)**;\n",
+    "3. remove those mitochondrial outliers;\n",
+    "4. retain cells with at least **200 detected genes**;\n",
+    "5. retain genes detected in at least **3 cells**.\n",
+    "\n",
+    "No upper cutoff for total counts or detected genes is applied here, because high-RNA pancreatic populations, particularly acinar cells, can have unusually large UMI counts."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def is_outlier(adata, metric, nmads=5):\n",
+    "    values = adata.obs[metric]\n",
+    "    median = np.median(values)\n",
+    "    deviation = mad(values)\n",
+    "\n",
+    "    return (\n",
+    "        (values < median - nmads * deviation)\n",
+    "        | (values > median + nmads * deviation)\n",
+    "    )\n",
+    "\n",
+    "\n",
+    "def primary_qc(adata):\n",
+    "    adata = adata.copy()\n",
+    "\n",
+    "    adata.obs[\"mt_outlier\"] = is_outlier(\n",
+    "        adata,\n",
+    "        \"pct_counts_mt\",\n",
+    "        nmads=5,\n",
+    "    )\n",
+    "\n",
+    "    adata = adata[\n",
+    "        (adata.obs[\"pct_counts_hb\"] < 20)\n",
+    "        & (~adata.obs[\"mt_outlier\"])\n",
+    "    ].copy()\n",
+    "\n",
+    "    sc.pp.filter_cells(\n",
+    "        adata,\n",
+    "        min_genes=200,\n",
+    "    )\n",
+    "\n",
+    "    sc.pp.filter_genes(\n",
+    "        adata,\n",
+    "        min_cells=3,\n",
+    "    )\n",
+    "\n",
+    "    return adata\n",
+    "\n",
+    "\n",
+    "for workflow, adata in list(adatas.items()):\n",
+    "    before = adata.n_obs\n",
+    "    adatas[workflow] = primary_qc(adata)\n",
+    "    after = adatas[workflow].n_obs\n",
+    "\n",
+    "    print(\n",
+    "        f\"{workflow}: \"\n",
+    "        f\"{before:,} -> {after:,} cells \"\n",
+    "        f\"after primary QC\"\n",
+    "    )\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Doublet detection\n",
+    "\n",
+    "Scrublet is run separately for each library. As in the original notebook, the expected doublet rate is calculated from the number of initially identified cells:\n",
+    "\n",
+    "`expected_doublet_rate = 7.6 × 10⁻⁶ × initial cell count`\n",
+    "\n",
+    "The automatically determined Scrublet threshold is used in this cleaned public version. Predicted doublets are removed before the two libraries are combined."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "scrublet_summary = []\n",
+    "\n",
+    "for workflow, adata in list(adatas.items()):\n",
+    "    expected_rate = 7.6e-6 * initial_cell_counts[workflow]\n",
+    "\n",
+    "    scrub = scr.Scrublet(\n",
+    "        adata.X,\n",
+    "        expected_doublet_rate=expected_rate,\n",
+    "    )\n",
+    "\n",
+    "    doublet_scores, predicted_doublets = scrub.scrub_doublets(\n",
+    "        min_counts=2,\n",
+    "    )\n",
+    "\n",
+    "    adata.obs[\"scrublet_score\"] = doublet_scores\n",
+    "    adata.obs[\"scrublet_db\"] = predicted_doublets\n",
+    "\n",
+    "    n_before = adata.n_obs\n",
+    "    n_doublets = int(predicted_doublets.sum())\n",
+    "\n",
+    "    adata = adata[~adata.obs[\"scrublet_db\"]].copy()\n",
+    "    n_after = adata.n_obs\n",
+    "\n",
+    "    adatas[workflow] = adata\n",
+    "\n",
+    "    scrublet_summary.append(\n",
+    "        {\n",
+    "            \"workflow\": workflow,\n",
+    "            \"expected_doublet_rate\": expected_rate,\n",
+    "            \"cells_before_doublet_removal\": n_before,\n",
+    "            \"predicted_doublets_removed\": n_doublets,\n",
+    "            \"cells_after_doublet_removal\": n_after,\n",
+    "        }\n",
+    "    )\n",
+    "\n",
+    "    print(\n",
+    "        f\"{workflow}: expected rate={expected_rate:.4f}; \"\n",
+    "        f\"removed {n_doublets} predicted doublets; \"\n",
+    "        f\"{n_after:,} cells retained\"\n",
+    "    )\n",
+    "\n",
+    "scrublet_summary = pd.DataFrame(scrublet_summary)\n",
+    "scrublet_summary\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. QC summary\n",
+    "\n",
+    "This table explicitly records cell numbers at each stage and can be used to document the order of QC operations."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "qc_rows = []\n",
+    "\n",
+    "for workflow, adata in adatas.items():\n",
+    "    scrub_row = scrublet_summary.loc[\n",
+    "        scrublet_summary[\"workflow\"] == workflow\n",
+    "    ].iloc[0]\n",
+    "\n",
+    "    qc_rows.append(\n",
+    "        {\n",
+    "            \"workflow\": workflow,\n",
+    "            \"initial_identified_cells\": initial_cell_counts[workflow],\n",
+    "            \"cells_after_primary_qc\": int(\n",
+    "                scrub_row[\"cells_before_doublet_removal\"]\n",
+    "            ),\n",
+    "            \"predicted_doublets_removed\": int(\n",
+    "                scrub_row[\"predicted_doublets_removed\"]\n",
+    "            ),\n",
+    "            \"cells_after_doublet_removal\": int(\n",
+    "                scrub_row[\"cells_after_doublet_removal\"]\n",
+    "            ),\n",
+    "        }\n",
+    "    )\n",
+    "\n",
+    "qc_summary = pd.DataFrame(qc_rows)\n",
+    "qc_summary.to_csv(QC_SUMMARY_FILE, index=False)\n",
+    "\n",
+    "qc_summary\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Combine libraries and save\n",
+    "\n",
+    "Only **Ficoll** and **Gradient-free** are retained in the combined object. The public workflow names are stored in `adata.obs[\"workflow\"]`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "combined = sc.concat(\n",
+    "    adatas,\n",
+    "    join=\"outer\",\n",
+    "    index_unique=\"_\",\n",
+    ")\n",
+    "\n",
+    "combined.write_h5ad(OUTPUT_FILE)\n",
+    "\n",
+    "print(combined)\n",
+    "print(f\"Saved AnnData: {OUTPUT_FILE}\")\n",
+    "print(f\"Saved QC summary: {QC_SUMMARY_FILE}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Notes for reproducibility\n",
+    "\n",
+    "- This notebook starts from filtered feature-barcode matrices generated upstream by the primary SeekSoul/SeekGene processing.\n",
+    "- Cell-level QC and Scrublet are performed separately for the two libraries.\n",
+    "- This notebook stops after primary QC and doublet removal. Normalization, dimensionality reduction, clustering, annotation, and manuscript figure generation should be performed in the subsequent analysis scripts/notebooks."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.7.12"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5}
